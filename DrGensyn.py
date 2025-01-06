@@ -163,9 +163,6 @@ def adjust_subtitle_gaps(subs, fps=25):
             adjusted_end_time = start_time - min_gap
             current_sub.end = pysrt.SubRipTime(seconds=adjusted_end_time)
 
-from dotenv import load_dotenv
-import os
-
 class ProcessingThread(QThread):
     """Håndterer asynkron processering"""
     status_update = pyqtSignal(str)

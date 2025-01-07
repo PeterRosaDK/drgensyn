@@ -15,11 +15,6 @@ class CondensationConfig:
         if self.temperatures is None:
             self.temperatures = [0.3, 0.7, 1.0]
 
-import os
-from typing import Optional, Callable, List
-from openai import AzureOpenAI
-from dotenv import load_dotenv
-
 class TextValidator:
     """Validerer output fra GPT."""
     @staticmethod

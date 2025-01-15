@@ -1,5 +1,6 @@
 import json
 import pysrt
+import spacy
 from dataclasses import dataclass
 from typing import List, Optional, Callable, Dict, Any
 from collections import Counter
@@ -10,6 +11,7 @@ class SegmentConfig:
     frame_duration_ms: int = 40  # 25 fps = 40ms per frame
     min_gap_frames: int = 4  # Minimum 4 frames mellem undertekster
     merge_threshold_sec: float = 7.0  # Standardværdi for sammenslåning af undertekster
+    max_subtitle_duration_sec: float = 7.0  # Maksimal varighed for en undertekst
     
     @property
     def min_gap_ms(self) -> int:
@@ -44,6 +46,15 @@ def attach_punctuation(words: List[tuple]) -> List[str]:
 class SRTGenerator:
     def __init__(self, config: Optional[SegmentConfig] = None):
         self.config = config or SegmentConfig()
+        self._raw_results = None
+        try:
+            self.nlp = spacy.load("da_core_news_lg")  # Dansk sprogmodel
+        except OSError:
+            try:
+                self.nlp = spacy.load("da_core_news_sm")  # Fallback til mindre model
+            except OSError:
+                print("Advarsel: Ingen sprogmodel tilgængelig - vil bruge simpel opdeling")
+                self.nlp = None
 
     def generate_metadata_subtitle(self, json_data: Dict[str, Any]) -> pysrt.SubRipItem:
         """Genererer undertekst med metadata"""
@@ -65,8 +76,154 @@ class SRTGenerator:
             text="\n".join(null_text)
         )
 
+    def build_text_from_timings(self, timings: List[Dict]) -> str:
+        """Byg tekst fra timing data med korrekt tegnsætning og mellemrum"""
+        text = []
+        for i, timing in enumerate(timings):
+            if timing["type"] == "word":
+                needs_space = False
+                
+                # Tilføj mellemrum hvis:
+                # 1. Det ikke er første ord
+                # 2. Det forrige element var et komma eller andet tegn der kræver mellemrum efter
+                # 3. Ordet ikke starter efter en bindestreg
+                if len(text) > 0:
+                    prev_was_comma = (
+                        i > 0 and 
+                        timings[i-1]["type"] == "punctuation" and 
+                        timings[i-1]["word"] in [",", ";", ":", "."]
+                    )
+                    # Altid mellemrum efter komma, men ellers kun hvis ikke sidste endte med bindestreg
+                    if prev_was_comma or (not text[-1].endswith("-")):
+                        needs_space = True
+                
+                word = " " + timing["word"] if needs_space else timing["word"]
+                text.append(word)
+                
+            else:  # punctuation
+                # For tegnsætning, tilføj direkte til sidste ord uden mellemrum
+                if text:
+                    text[-1] = text[-1] + timing["word"]
+                else:
+                    # Hvis der ikke er noget ord at tilføje til, undgå at tilføje punktuation
+                    if timing["word"] not in [".", ",", "?", "!"]:
+                        text.append(timing["word"])
+                    
+        result = "".join(text)
+        print(f"      DEBUG: Built text: '{result}'")  # Debug output
+        return result
+
+    def _find_split_candidates(self, timings: List[Dict]) -> List[int]:
+        """Find alle mulige split points sorteret efter prioritet."""
+        total_duration = timings[-1]["end"] - timings[0]["start"]
+        min_segment_duration = 2.0  # Minimum 2 sekunder per segment
+        candidates = []
+
+        # Find splitting-punkter baseret på kommaer først
+        for i, timing in enumerate(timings[:-1]):  # Undgå sidste element
+            if timing["type"] == "punctuation" and timing["word"] == ",":
+                next_word_idx = next(
+                    (j for j in range(i + 1, len(timings)) if timings[j]["type"] == "word"),
+                    None
+                )
+                if next_word_idx is None:
+                    continue
+
+                left_duration = timing["end"] - timings[0]["start"]
+                right_duration = timings[-1]["end"] - timings[next_word_idx]["start"]
+
+                if left_duration >= min_segment_duration and right_duration >= min_segment_duration:
+                    candidates.append(next_word_idx)
+
+        # Hvis der ikke er nok kommaer, brug SpaCy-model
+        if self.nlp:
+            text = " ".join(t["word"] for t in timings if t["type"] == "word")
+            doc = self.nlp(text)
+
+            # Byg mapping mellem tokens og timing-indekser
+            token_to_idx = {}
+            word_count = 0
+            for i, t in enumerate(timings):
+                if t["type"] == "word":
+                    token_to_idx[word_count] = i
+                    word_count += 1
+
+            # Find splitting-punkter baseret på syntaks og præpositioner
+            for token in doc:
+                if token.i not in token_to_idx:
+                    continue
+
+                timing_idx = token_to_idx[token.i]
+
+                # Undgå splits tæt på eksisterende
+                if any(abs(timing_idx - c) < 3 for c in candidates):
+                    continue
+
+                # Split ved:
+                # - Markører (som "at", "der")
+                # - Præpositioner (som "med", "i", "på")
+                # - Hovedord i afhængigheder (subjekt, objekt)
+                if token.dep_ in ["mark", "prep", "nsubj", "obj"] or token.is_sent_start:
+                    left_duration = timings[timing_idx]["end"] - timings[0]["start"]
+                    right_duration = timings[-1]["end"] - timings[timing_idx]["start"]
+
+                    if left_duration >= min_segment_duration and right_duration >= min_segment_duration:
+                        candidates.append(timing_idx)
+
+        # Sortér kandidater efter position (baglæns, så de bedste er sidst)
+        return sorted(candidates, reverse=True)
+
+    def find_split_points(self, timings: List[Dict], max_duration: float) -> List[int]:
+        """Find optimale split points for at holde segmenter under max_duration"""
+        total_duration = timings[-1]["end"] - timings[0]["start"]
+        if total_duration <= max_duration:
+            return []
+            
+        print(f"      DEBUG: Finding splits for duration {total_duration:.1f}s (max {max_duration:.1f}s)")
+        
+        # Find alle potentielle split points
+        candidates = self._find_split_candidates(timings)
+        if not candidates:
+            print("      DEBUG: No candidates found")
+            return []
+        
+        # Find nødvendige splits
+        splits = []
+        current_start = 0
+        
+        for split_idx in candidates:
+            # Check varigheden af segmentet fra current_start til split
+            if split_idx <= current_start:
+                continue
+                
+            segment_duration = timings[split_idx]["end"] - timings[current_start]["start"]
+            print(f"      DEBUG: Checking segment {current_start} to {split_idx}: {segment_duration:.1f}s")
+            
+            if segment_duration > max_duration:
+                # Hvis dette segment er for langt, brug forrige split
+                if splits:
+                    current_start = splits[-1]
+                continue
+            
+            # Check varigheden af det resterende segment
+            remaining_duration = timings[-1]["end"] - timings[split_idx]["end"]
+            if remaining_duration <= max_duration:
+                # Dette split giver to gode segmenter
+                splits.append(split_idx)
+                print(f"      DEBUG: Added split at {split_idx}")
+                break
+            
+            # Ellers tilføj dette split og fortsæt
+            splits.append(split_idx)
+            current_start = split_idx
+            print(f"      DEBUG: Added intermediate split at {split_idx}")
+        
+        print(f"      DEBUG: Final splits: {splits}")
+        return splits
+
     def process_results(self, results: List[Dict]) -> List[pysrt.SubRipItem]:
         """Behandler resultater fra JSON og laver undertekster"""
+        self._raw_results = results.copy()
         srt_items = []
         current_block = []
         block_start_time = None
@@ -111,6 +268,152 @@ class SRTGenerator:
         
         return srt_items
 
+    def split_long_subtitles(self, srt_items: List[pysrt.SubRipItem]) -> List[pysrt.SubRipItem]:
+        """Del lange undertekster i mindre blokke baseret på kommaer og syntaks"""
+        if not self._raw_results:
+            print("### Ingen raw_results tilgængelige")
+            return srt_items
+                
+        new_items = []
+        
+        # Først bygger vi en komplet liste af alle ord og deres timings
+        print("\n### Bygger timing data...")
+        all_timings = []
+        for item in self._raw_results:
+            if item["type"] == "word" or item["type"] == "punctuation":
+                timing = {
+                    "word": item["alternatives"][0]["content"],
+                    "start": item["start_time"],
+                    "end": item.get("end_time", item["start_time"]),
+                    "type": item["type"]
+                }
+                if item.get("attaches_to") == "previous":
+                    timing["attaches_to"] = "previous"
+                all_timings.append(timing)
+        
+        print(f"Byggede {len(all_timings)} timing elementer")
+        
+        # Process each subtitle
+        for item in srt_items:
+            if item.index == 1:  # Keep metadata
+                new_items.append(item)
+                continue
+            
+            duration_sec = (item.end.ordinal - item.start.ordinal) / 1000.0
+            print(f"\nUndertekst {item.index}: '{item.text[:50]}...' ({duration_sec:.1f} sek)")
+            
+            if duration_sec <= self.config.max_subtitle_duration_sec:
+                print(f"  Undertekst er kort nok ({duration_sec:.1f} ≤ {self.config.max_subtitle_duration_sec:.1f})")
+                new_items.append(item)
+                continue
+                
+            print(f"  Undertekst er for lang ({duration_sec:.1f} > {self.config.max_subtitle_duration_sec:.1f})")
+            
+            # Find alle timings der falder inden for denne underteksts tidsinterval
+            subtitle_start = item.start.ordinal / 1000.0  # Konverter til sekunder
+            subtitle_end = item.end.ordinal / 1000.0
+            
+            segment_timings = []
+            for timing in all_timings:
+                if (timing["start"] >= subtitle_start - 0.1 and  # Tillad 100ms tolerance
+                    timing["end"] <= subtitle_end + 0.1):
+                    segment_timings.append(timing)
+            
+            if not segment_timings:
+                print("  ADVARSEL: Kunne ikke finde timing data for teksten!")
+                new_items.append(item)
+                continue
+            
+            print(f"  Fandt {len(segment_timings)} timing elementer mellem {subtitle_start:.2f}s og {subtitle_end:.2f}s")
+            split_points = self.find_split_points(segment_timings, self.config.max_subtitle_duration_sec)
+            print(f"  Fandt {len(split_points)} split points: {split_points}")
+            
+            if not split_points:
+                new_items.append(item)
+                continue
+                
+            # Del teksten ved alle split points
+            start_idx = 0
+            split_points = sorted(split_points)  # Sikr at punkterne er i rækkefølge
+                
+            for i, split_idx in enumerate(split_points):
+                if split_idx <= start_idx:
+                    continue
+                    
+                segment = segment_timings[start_idx:split_idx]
+                if not segment:  # Sikr at vi har noget at arbejde med
+                    continue
+                    
+                text = self.build_text_from_timings(segment)
+                segment_duration = segment[-1]["end"] - segment[0]["start"]
+                print(f"  Deler segment {i+1}: '{text}' ({segment_duration:.1f} sek)")
+                    
+                # Tilføj bindestreger for fortsættelse
+                if start_idx > 0:
+                    text = "- " + text
+                if i < len(split_points) or split_idx < len(segment_timings):
+                    # Fjern eventuelt komma før bindestreg
+                    if text.endswith(","):
+                        text = text[:-1]  # Fjern sidste komma
+                    text += " -"
+                    
+                start_time = segment[0]["start"]
+                end_time = segment[-1]["end"]
+                    
+                # Sikr at timing er inden for original underteksts grænser
+                start_time = max(start_time, subtitle_start)
+                end_time = min(end_time, subtitle_end)
+                    
+                new_item = pysrt.SubRipItem(
+                    index=len(new_items) + 1,
+                    start=pysrt.SubRipTime(milliseconds=int(start_time * 1000)),
+                    end=pysrt.SubRipTime(milliseconds=int(end_time * 1000)),
+                    text=text
+                )
+                    
+                if hasattr(item, 'speaker'):
+                    new_item.speaker = item.speaker
+                    
+                new_items.append(new_item)
+                start_idx = split_idx
+                
+            # Håndter sidste segment hvis nødvendigt
+            if start_idx < len(segment_timings):
+                segment = segment_timings[start_idx:]
+                if segment:  # Sikr at vi har noget at arbejde med
+                    text = self.build_text_from_timings(segment)
+                    segment_duration = segment[-1]["end"] - segment[0]["start"]
+                    print(f"  Sidste segment: '{text}' ({segment_duration:.1f} sek)")
+                    
+                    # Tilføj bindestreger for sidste del
+                    if start_idx > 0:
+                        text = "- " + text
+                        
+                    start_time = segment[0]["start"]
+                    end_time = segment[-1]["end"]
+                        
+                    # Sikr at timing er inden for original underteksts grænser
+                    start_time = max(start_time, subtitle_start)
+                    end_time = min(end_time, subtitle_end)
+                        
+                    new_item = pysrt.SubRipItem(
+                        index=len(new_items) + 1,
+                        start=pysrt.SubRipTime(milliseconds=int(start_time * 1000)),
+                        end=pysrt.SubRipTime(milliseconds=int(end_time * 1000)),
+                        text=text
+                    )
+                        
+                    if hasattr(item, 'speaker'):
+                        new_item.speaker = item.speaker
+                        
+                    new_items.append(new_item)
+            
+        # Renummerér undertekster
+        for i, item in enumerate(new_items, start=1):
+            item.index = i
+            
+        return new_items
+    
     def merge_subtitles(self, srt_items: List[pysrt.SubRipItem]) -> List[pysrt.SubRipItem]:
         """Slår korte undertekster sammen"""
         if not srt_items:
@@ -136,7 +439,7 @@ class SRTGenerator:
             else:
                 merged_items.append(item)
         
-        # Renumber subtitles
+        # Renummerér undertekster
         for i, item in enumerate(merged_items, start=1):
             item.index = i
             
@@ -191,6 +494,10 @@ def segment_json(json_data: Dict[str, Any],
         srt_items = generator.merge_subtitles(srt_items)
 
         if progress_callback:
+            progress_callback("Deler lange undertekster...")
+        srt_items = generator.split_long_subtitles(srt_items)
+
+        if progress_callback:
             progress_callback("Forlænger udtider for undertekster...")
         srt_items = generator.extend_subtitle_end_time(srt_items)
 
@@ -203,6 +510,7 @@ def segment_json(json_data: Dict[str, Any],
         if progress_callback:
             progress_callback(f"Fejl under segmentering: {str(e)}")
         return None
+
 
 if __name__ == "__main__":
     import sys

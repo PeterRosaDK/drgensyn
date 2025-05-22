@@ -1,11 +1,12 @@
 import sys
 from dotenv import load_dotenv
 import os
+import configparser
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QFileDialog, QLabel, QCheckBox, QSpinBox, 
-    QProgressBar, QFrame, QGroupBox, QComboBox, QTextEdit, QMenu
+    QProgressBar, QFrame, QDoubleSpinBox, QGroupBox, QComboBox, QTextEdit, QMenu
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QPalette, QColor, QBrush
@@ -14,7 +15,7 @@ import json
 import pysrt
 from DrGenkend import recognize_speech
 from DrSegment import segment_json
-from DrKondens import condense_text
+from DrKondens import condense_texts
 
 class Colors:
     """Farvetema for applikationen"""
@@ -274,40 +275,56 @@ class ProcessingThread(QThread):
                 total_subs = len(subs)
                 self.status_update.emit(f"Behandler {total_subs} undertekster...")
 
+                texts_to_condense = []
+                text_indices = []
+                formatted_texts = []
+                
                 for i, sub in enumerate(subs):
-                    sub_progress = int(current_progress + (30 * (i / total_subs)))
+                    sub_progress = int(current_progress + (15 * (i / total_subs)))
                     self.progress_update.emit(sub_progress)
 
                     # Brug TextFormatter til at tjekke om teksten skal kondenseres
                     formatted_text, needs_condensing = formatter.format_text(sub.text)
-
+                    formatted_texts.append(formatted_text)
+                    
                     if needs_condensing:
-                        self.status_update.emit(f"Kondenserer tekst {i+1}/{total_subs}...")
-                        condensed = condense_text(
-                            text=sub.text,
-                            max_chars=max_chars,
-                            progress_callback=lambda msg: self.status_update.emit(msg)
-                        )
-                        
-                        if condensed:
-                            # Formatér den kondenserede tekst
-                            formatted_condensed, still_needs_condensing = formatter.format_text(condensed)
-                            if not still_needs_condensing:
-                                sub.text = formatted_condensed
-                                stats["condensed"] += 1
-                            else:
-                                sub.text = condensed
-                                stats["condensed"] += 1
-                        else:
-                            # Hvis kondensering fejlede, behold original formatering
-                            sub.text = formatted_text
-                            stats["errors"] += 1
+                        texts_to_condense.append(sub.text)
+                        text_indices.append(i)
                     else:
                         sub.text = formatted_text
                         if '\n' in formatted_text:
                             stats["formatted"] += 1
                         else:
                             stats["unchanged"] += 1
+                
+                # Kondenser alle tekster der behøver det på én gang
+                if texts_to_condense:
+                    self.status_update.emit(f"Kondenserer {len(texts_to_condense)} tekster...")
+                    
+                    # Brug den nye condense_texts funktion for batch processing
+                    condensed_texts = condense_texts(
+                        texts=texts_to_condense,
+                        max_chars=max_chars,
+                        progress_callback=lambda msg, i, total: self.status_update.emit(f"{msg} ({i+1}/{total})")
+                    )
+                    
+                    # Opdater undertekster med kondenserede versioner
+                    for idx, condensed in zip(text_indices, condensed_texts):
+                        if condensed:
+                            # Formatér den kondenserede tekst
+                            formatted_condensed, still_needs_condensing = formatter.format_text(condensed)
+                            if not still_needs_condensing:
+                                subs[idx].text = formatted_condensed
+                            else:
+                                subs[idx].text = condensed
+                            stats["condensed"] += 1
+                        else:
+                            # Hvis kondensering fejlede, behold original formatering
+                            subs[idx].text = formatted_texts[idx]
+                            stats["errors"] += 1
+                    
+                    sub_progress = int(current_progress + 25)
+                    self.progress_update.emit(sub_progress)
 
                 # Justér undertekstgaps før gemning
                 adjust_subtitle_gaps(subs, fps=25)
@@ -407,6 +424,7 @@ class DrOrkestrator(QMainWindow):
         super().__init__()
         self.custom_dictionary = []
         self.init_ui()
+        load_settings_to_gui(self) # Indlæs indstillinger fra config.ini
         self.current_file = None  # Holder styr på den aktuelt valgte fil
 
         # Forbind checkbox ændringer med UI-opdateringer
@@ -745,7 +763,6 @@ class DrOrkestrator(QMainWindow):
             self.progress_bar.setValue(0)
 
     def create_module_section(self) -> QWidget:
-        # Opret container widget i stedet for group
         container = QWidget()
         layout = QHBoxLayout(container)
         layout.setSpacing(10)
@@ -765,12 +782,11 @@ class DrOrkestrator(QMainWindow):
                 left: 10px;
             }}
         """)
-        
-        # Modul layout
+
         modules_layout = QVBoxLayout()
         modules_layout.setContentsMargins(5, 5, 5, 5)
-        
-        # Dr. Genkend
+
+        # Dr. Genkend – hovedvalg
         genkend_layout = QHBoxLayout()
         self.genkend_check = QCheckBox("Talegenkendelse")
         self.genkend_check.setChecked(True)
@@ -781,13 +797,40 @@ class DrOrkestrator(QMainWindow):
         genkend_layout.addStretch()
         modules_layout.addLayout(genkend_layout)
 
+        # Underindstillinger til Dr. Genkend
+        genkend_settings_layout = QHBoxLayout()
+
+        self.speaker_sens_spin = QDoubleSpinBox()
+        self.speaker_sens_spin.setRange(0.0, 1.0)
+        self.speaker_sens_spin.setSingleStep(0.1)
+        self.speaker_sens_spin.setValue(0.8)
+        self.speaker_sens_spin.setPrefix("Speaker: ")
+
+        self.punct_sens_spin = QDoubleSpinBox()
+        self.punct_sens_spin.setRange(0.0, 1.0)
+        self.punct_sens_spin.setSingleStep(0.1)
+        self.punct_sens_spin.setValue(0.4)
+        self.punct_sens_spin.setPrefix("Tegn: ")
+
+        self.volume_thresh_spin = QDoubleSpinBox()
+        self.volume_thresh_spin.setRange(0.0, 10.0)
+        self.volume_thresh_spin.setSingleStep(0.1)
+        self.volume_thresh_spin.setValue(2.4)
+        self.volume_thresh_spin.setPrefix("Vol: ")
+
+        genkend_settings_layout.addWidget(self.speaker_sens_spin)
+        genkend_settings_layout.addWidget(self.punct_sens_spin)
+        genkend_settings_layout.addWidget(self.volume_thresh_spin)
+        genkend_settings_layout.addStretch()
+        modules_layout.addLayout(genkend_settings_layout)
+
         # Dr. Segment
         segment_layout = QHBoxLayout()
         self.segment_check = QCheckBox("Segmentering")
         self.segment_check.setChecked(True)
         self.merge_threshold_spin = QSpinBox()
         self.merge_threshold_spin.setRange(1, 10)
-        self.merge_threshold_spin.setValue(7)
+        self.merge_threshold_spin.setValue(6)
         self.merge_threshold_spin.setPrefix("Ideal: ")
         self.merge_threshold_spin.setSuffix(" sekunder")
         segment_layout.addWidget(self.segment_check)
@@ -828,7 +871,7 @@ class DrOrkestrator(QMainWindow):
         """)
         dictionary_layout = QVBoxLayout()
         dictionary_layout.setContentsMargins(5, 5, 5, 5)
-        
+
         self.dictionary_input = QTextEdit(self)
         self.dictionary_input.setPlaceholderText(
             "Skriv ét ord eller en sætning per linje.\n"
@@ -837,7 +880,7 @@ class DrOrkestrator(QMainWindow):
         self.dictionary_input.setMaximumHeight(100)
         self.dictionary_input.textChanged.connect(self.update_custom_dictionary)
         dictionary_layout.addWidget(self.dictionary_input)
-        
+
         dictionary_group.setLayout(dictionary_layout)
         layout.addWidget(dictionary_group, stretch=2)
 
@@ -904,6 +947,9 @@ class DrOrkestrator(QMainWindow):
             self.update_status("Køen er tom. Tilføj filer først.")
             return
 
+        # Gem indstillinger til config.ini
+        save_settings_from_gui(self)
+
         # Deaktiver start-knap og nulstil progress
         self.start_button.setEnabled(False)
         self.progress_bar.setValue(0)
@@ -912,7 +958,6 @@ class DrOrkestrator(QMainWindow):
         self.process_next_file()
 
     def get_config(self) -> dict:
-        """Henter konfiguration baseret på brugerens valg i GUI."""
         language_map = {
             "Dansk": "da",
             "Engelsk": "en",
@@ -921,7 +966,10 @@ class DrOrkestrator(QMainWindow):
         return {
             "language": language_map.get(self.language_combo.currentText(), "auto"),
             "additional_vocab": self.custom_dictionary,
-            "merge_threshold_sec": self.merge_threshold_spin.value()
+            "merge_threshold_sec": self.merge_threshold_spin.value(),
+            "speaker_sensitivity": self.speaker_sens_spin.value(),
+            "punctuation_sensitivity": self.punct_sens_spin.value(),
+            "volume_threshold": self.volume_thresh_spin.value()
         }
 
     def update_custom_dictionary(self):
@@ -943,6 +991,50 @@ class DrOrkestrator(QMainWindow):
                     entry = {"content": line.strip()}
                 self.custom_dictionary.append(entry)
         self.update_status(f"Ordbog opdateret: {len(self.custom_dictionary)} ord")
+
+# Indlæs og gem indstillinger
+SETTINGS_FILE = "settings.ini"
+
+def save_settings_from_gui(window):
+    config = configparser.ConfigParser()
+    config["GENKEND"] = {
+        "language": window.language_combo.currentText(),
+        "speaker_sensitivity": f"{window.speaker_sens_spin.value():.2f}",
+        "punctuation_sensitivity": f"{window.punct_sens_spin.value():.2f}",
+        "volume_threshold": f"{window.volume_thresh_spin.value():.2f}",
+    }
+    config["SEGMENT"] = {
+        "merge_threshold_sec": str(window.merge_threshold_spin.value())
+    }
+    config["KONDENS"] = {
+        "max_chars": str(window.max_chars_spin.value())
+    }
+
+    with open(SETTINGS_FILE, "w") as f:
+        config.write(f)
+
+def load_settings_to_gui(window):
+    if not os.path.exists(SETTINGS_FILE):
+        return  # Gør intet hvis filen ikke findes
+
+    config = configparser.ConfigParser()
+    config.read(SETTINGS_FILE)
+
+    # GENKEND
+    language = config.get("GENKEND", "language", fallback="Auto")
+    index = window.language_combo.findText(language)
+    if index >= 0:
+        window.language_combo.setCurrentIndex(index)
+
+    window.speaker_sens_spin.setValue(config.getfloat("GENKEND", "speaker_sensitivity", fallback=0.8))
+    window.punct_sens_spin.setValue(config.getfloat("GENKEND", "punctuation_sensitivity", fallback=0.4))
+    window.volume_thresh_spin.setValue(config.getfloat("GENKEND", "volume_threshold", fallback=2.4))
+
+    # SEGMENT
+    window.merge_threshold_spin.setValue(config.getint("SEGMENT", "merge_threshold_sec", fallback=6))
+
+    # KONDENS
+    window.max_chars_spin.setValue(config.getint("KONDENS", "max_chars", fallback=37))
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

@@ -48,10 +48,10 @@ class SRTGenerator:
         self.config = config or SegmentConfig()
         self._raw_results = None
         try:
-            self.nlp = spacy.load("da_core_news_lg")  # Dansk sprogmodel
+            self.nlp = spacy.load("da_core_news_sm")  # Dansk sprogmodel
         except OSError:
             try:
-                self.nlp = spacy.load("da_core_news_sm")  # Fallback til mindre model
+                self.nlp = spacy.load("en_core_web_sm")  # Fallback til engelsk model
             except OSError:
                 print("Advarsel: Ingen sprogmodel tilgængelig - vil bruge simpel opdeling")
                 self.nlp = None
@@ -105,72 +105,78 @@ class SRTGenerator:
                 if text:
                     text[-1] = text[-1] + timing["word"]
                 else:
-                    # Hvis der ikke er noget ord at tilføje til, undgå at tilføje punktuation
-                    if timing["word"] not in [".", ",", "?", "!"]:
+                    # Hvis der ikke er noget ord at tilføje til, opret nyt element
+                    # MEN, vi vil ikke have punktum i starten
+                    if timing["word"] not in [".", "!"]:
                         text.append(timing["word"])
-                    
+        
         result = "".join(text)
         print(f"      DEBUG: Built text: '{result}'")  # Debug output
         return result
 
     def _find_split_candidates(self, timings: List[Dict]) -> List[int]:
-        """Find alle mulige split points sorteret efter prioritet."""
+        """Find alle mulige split points sorteret efter prioritet"""
         total_duration = timings[-1]["end"] - timings[0]["start"]
         min_segment_duration = 2.0  # Minimum 2 sekunder per segment
         candidates = []
-
-        # Find splitting-punkter baseret på kommaer først
+        
+        # Find alle kommaer der giver fornuftige splits
         for i, timing in enumerate(timings[:-1]):  # Undgå sidste element
+            # Kun check på kommaer
             if timing["type"] == "punctuation" and timing["word"] == ",":
-                next_word_idx = next(
-                    (j for j in range(i + 1, len(timings)) if timings[j]["type"] == "word"),
-                    None
-                )
+                # Find det næste ord efter kommaet
+                next_word_idx = None
+                for j in range(i + 1, len(timings)):
+                    if timings[j]["type"] == "word":
+                        next_word_idx = j
+                        break
+                
                 if next_word_idx is None:
                     continue
-
+                    
+                # Check varigheder før og efter dette komma
                 left_duration = timing["end"] - timings[0]["start"]
                 right_duration = timings[-1]["end"] - timings[next_word_idx]["start"]
-
-                if left_duration >= min_segment_duration and right_duration >= min_segment_duration:
+                
+                if (left_duration >= min_segment_duration and 
+                    right_duration >= min_segment_duration):
+                    # Gem indexet for ordet efter kommaet
                     candidates.append(next_word_idx)
-
-        # Hvis der ikke er nok kommaer, brug SpaCy-model
-        if self.nlp:
+        
+        # Hvis vi ikke har nok kommaer og har Spacy, find syntaktiske splits
+        if len(candidates) < 1 and self.nlp:
             text = " ".join(t["word"] for t in timings if t["type"] == "word")
             doc = self.nlp(text)
-
-            # Byg mapping mellem tokens og timing-indekser
+            
+            # Byg mapping mellem tokens og timing indices
             token_to_idx = {}
             word_count = 0
             for i, t in enumerate(timings):
                 if t["type"] == "word":
                     token_to_idx[word_count] = i
                     word_count += 1
-
-            # Find splitting-punkter baseret på syntaks og præpositioner
+            
+            # Find potentielle splits ved præpositioner og ledsætninger
             for token in doc:
                 if token.i not in token_to_idx:
                     continue
-
+                
                 timing_idx = token_to_idx[token.i]
-
+                
                 # Undgå splits tæt på eksisterende
                 if any(abs(timing_idx - c) < 3 for c in candidates):
                     continue
-
-                # Split ved:
-                # - Markører (som "at", "der")
-                # - Præpositioner (som "med", "i", "på")
-                # - Hovedord i afhængigheder (subjekt, objekt)
-                if token.dep_ in ["mark", "prep", "nsubj", "obj"] or token.is_sent_start:
+                
+                # Check kun præpositioner og ledsætningsmarkører
+                if token.dep_ in ["prep", "mark"]:
                     left_duration = timings[timing_idx]["end"] - timings[0]["start"]
                     right_duration = timings[-1]["end"] - timings[timing_idx]["start"]
-
-                    if left_duration >= min_segment_duration and right_duration >= min_segment_duration:
+                    
+                    if (left_duration >= min_segment_duration and 
+                        right_duration >= min_segment_duration):
                         candidates.append(timing_idx)
-
-        # Sortér kandidater efter position (baglæns, så de bedste er sidst)
+        
+        # Sortér kandidater efter position (bagfra)
         return sorted(candidates, reverse=True)
 
     def find_split_points(self, timings: List[Dict], max_duration: float) -> List[int]:
@@ -351,10 +357,12 @@ class SRTGenerator:
                 # Tilføj bindestreger for fortsættelse
                 if start_idx > 0:
                     text = "- " + text
-                if i < len(split_points) or split_idx < len(segment_timings):
-                    # Fjern eventuelt komma før bindestreg
+                    
+                # Hvis teksten skal slutte med en bindestreg og den slutter med et komma,
+                # fjern kommaet før bindestegen tilføjes
+                if (i < len(split_points) or split_idx < len(segment_timings)):
                     if text.endswith(","):
-                        text = text[:-1]  # Fjern sidste komma
+                        text = text[:-1]  # Fjern kommaet
                     text += " -"
                     
                 start_time = segment[0]["start"]
@@ -376,7 +384,7 @@ class SRTGenerator:
                     
                 new_items.append(new_item)
                 start_idx = split_idx
-                
+            
             # Håndter sidste segment hvis nødvendigt
             if start_idx < len(segment_timings):
                 segment = segment_timings[start_idx:]

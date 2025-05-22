@@ -31,6 +31,9 @@ class RecognitionConfig:
     permitted_marks: list = None
     additional_vocab: list = None
     merge_threshold_sec: Optional[float] = None  # Tilføj det nye argument
+    speaker_sensitivity: Optional[float] = None
+    punctuation_sensitivity: Optional[float] = None
+    volume_threshold: Optional[float] = None
     
     def __post_init__(self):
         if self.permitted_marks is None:
@@ -47,13 +50,36 @@ class RecognitionConfig:
                 "permitted_marks": self.permitted_marks
             }
         }
+
+        # Tilføj speaker sensitivity hvis sat
+        if self.diarization == "speaker" and self.speaker_sensitivity is not None:
+            transcription_config["speaker_diarization_config"] = {
+                "speaker_sensitivity": self.speaker_sensitivity
+            }
+
+        # Tilføj punctuation sensitivity hvis sat
+        if self.punctuation_sensitivity is not None:
+            if "punctuation_overrides" not in transcription_config:
+                transcription_config["punctuation_overrides"] = {}
+            transcription_config["punctuation_overrides"]["sensitivity"] = self.punctuation_sensitivity
+
+        # Tilføj volume threshold hvis sat
+        if self.volume_threshold is not None:
+            transcription_config["audio_filtering_config"] = {
+                "volume_threshold": self.volume_threshold
+            }
+
+        # Tilføj ordbog hvis sat
         if self.additional_vocab:
             transcription_config["additional_vocab"] = self.additional_vocab
-        
+
+        logger.debug(f"Final transcription config: {transcription_config}")
+
         return {
             "type": "transcription",
             "transcription_config": transcription_config
         }
+
 
 class AudioConverter:
     """Håndterer konvertering af video/lyd til WAV format"""

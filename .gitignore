@@ -1,0 +1,17 @@
+# Ignorerer midlertidige og cachede filer
+__pycache__/
+*.pyc
+
+# Logfiler
+*.log
+
+# Miljøfiler og configs
+.env
+settings.ini
+
+# Mediefiler du ikke vil uploade
+*.mp4
+*.exe
+
+# Hvis du bruger VS Code
+.vscode/

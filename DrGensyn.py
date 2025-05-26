@@ -304,10 +304,11 @@ class ProcessingThread(QThread):
                     # Brug den nye condense_texts funktion for batch processing
                     condensed_texts = condense_texts(
                         texts=texts_to_condense,
-                        max_chars=max_chars,
+                        chars_per_line=max_chars,    # ✅ Brug chars_per_line i stedet
+                        lines_per_subtitle=2,        # ✅ Tilføj lines_per_subtitle 
                         progress_callback=lambda msg, i, total: self.status_update.emit(f"{msg} ({i+1}/{total})")
                     )
-                    
+
                     # Opdater undertekster med kondenserede versioner
                     for idx, condensed in zip(text_indices, condensed_texts):
                         if condensed:

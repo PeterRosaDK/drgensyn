@@ -7,13 +7,17 @@ from dotenv import load_dotenv
 @dataclass
 class CondensationConfig:
     """Konfiguration for tekstkondensering"""
-    max_chars: int  # Maksimal længde for kondenseret tekst
+    chars_per_line: int  # Tegn per linje (f.eks. 37)
+    lines_per_subtitle: int = 2  # Antal linjer per undertekst (standard 2)
     model_name: str = "gptx4xo_relaxed"
     temperatures: List[float] = None
+    max_chars: int = None  # Beregnes automatisk i __post_init__
 
     def __post_init__(self):
         if self.temperatures is None:
             self.temperatures = [0.3, 0.7, 1.0]
+        if self.max_chars is None:
+            self.max_chars = self.chars_per_line * self.lines_per_subtitle
 
 class TextValidator:
     """Validerer output fra GPT."""
@@ -42,7 +46,7 @@ class TextCondenser:
     2. Bruge naturligt dansk talesprog.
     3. Beholde så mange af de oprindelige ord som muligt, så undgå at finde på synonymer.
     4. Aldrig bruge forkortelser eller specialtegn.
-    5. Hver undertekst må højst indeholde {max_chars} tegn.
+    5. Hver undertekst kan fylde op til {lines} linjer à {chars_per_line} tegn = maksimalt {max_chars} tegn.
     6. Hvis teksten begynder med "-" betyder det, at det er fortsættelsen af en sætning, så bevar tonen og stil.
     7. Hvis teksten slutter med "-" betyder det, at sætningen fortsætter i næste undertekst, så bevar afslutningen naturlig."""
 
@@ -75,10 +79,12 @@ class TextCondenser:
                 clean_text = text[:-2]
                 
             print(f"Genererer forslag (temp={temperature}, fortsættelse={is_continuation}, fortsætter={continues})")
+            print(f"Target længde: {adjusted_target} tegn ({self.config.lines_per_subtitle} linjer à {self.config.chars_per_line} tegn)")
             
             prompt = f"""
                 Omskriv denne tekst til en kortere version på omkring {adjusted_target} tegn.
                 Den må IKKE være længere end {adjusted_target} tegn.
+                Teksten kan fylde op til {self.config.lines_per_subtitle} linjer à {self.config.chars_per_line} tegn.
                 Bevar den væsentlige mening og brug naturligt dansk sprog.
                 
                 {f"Dette er fortsættelsen af en sætning, så bevar stil og tone der passer til det." if is_continuation else ""}
@@ -91,12 +97,16 @@ class TextCondenser:
                 model=self.config.model_name,
                 temperature=temperature,
                 messages=[
-                    {"role": "system", "content": self.SYSTEM_PROMPT.format(max_chars=self.config.max_chars)},
+                    {"role": "system", "content": self.SYSTEM_PROMPT.format(
+                        max_chars=self.config.max_chars,
+                        chars_per_line=self.config.chars_per_line,
+                        lines=self.config.lines_per_subtitle
+                    )},
                     {"role": "user", "content": prompt}
                 ],
             )
             output = response.choices[0].message.content.strip()
-            print(f"GPT output: {output}")
+            print(f"GPT output: {output} ({len(output)} tegn)")
             
             # Tilføj fortsættelsesstreger igen hvis nødvendigt
             if is_continuation and not output.startswith("- "):
@@ -128,6 +138,7 @@ class TextCondenser:
         strict_prompt = f"""
         Din opgave er at forkorte følgende tekst til én kort sætning, der bevarer den vigtigste mening. 
         Teksten må IKKE være længere end {target_length} tegn.
+        Teksten kan fylde op til {self.config.lines_per_subtitle} linjer à {self.config.chars_per_line} tegn.
         Teksten skal være naturligt afrundet og må ALDRIG slutte med "..." eller føles ufuldstændig.
         
         {f"Dette er fortsættelsen af en sætning, bevar stil/tone der passer til det." if is_continuation else ""}
@@ -138,6 +149,7 @@ class TextCondenser:
         
         try:
             print("Fallback: Genererer en strikt kondensering.")
+            print(f"Fallback target: {target_length} tegn")
             response = self.client.chat.completions.create(
                 model=self.config.model_name,
                 temperature=0.0,  # Meget præcis kondensering
@@ -147,7 +159,7 @@ class TextCondenser:
                 ],
             )
             result = response.choices[0].message.content.strip()
-            print(f"Fallback-output: {result}")
+            print(f"Fallback-output: {result} ({len(result)} tegn)")
             
             # Tilføj fortsættelsesstreger igen hvis nødvendigt
             if is_continuation and not result.startswith("- "):
@@ -164,6 +176,7 @@ class TextCondenser:
         """Kondenserer tekst til kortere version med bevidsthed om fortsættelsesstreger."""
         try:
             print(f"Kondenserer tekst: {text}")
+            print(f"Max tilladt længde: {self.config.max_chars} tegn ({self.config.lines_per_subtitle} linjer à {self.config.chars_per_line} tegn)")
             if progress_callback:
                 progress_callback("Starter kondensering med GPT")
                 
@@ -181,7 +194,7 @@ class TextCondenser:
             if proposals:
                 # Vælg det længste gyldige forslag
                 best_proposal = max(proposals, key=len)
-                print(f"Valgte det længste gyldige forslag: {best_proposal}")
+                print(f"Valgte det længste gyldige forslag: {best_proposal} ({len(best_proposal)} tegn)")
                 return best_proposal
 
             # Ingen gyldige forslag: anvend fallback
@@ -265,18 +278,19 @@ class TextCondenser:
             
         return result
 
-def condense_texts(texts: list, max_chars: int, progress_callback: Optional[Callable[[str, int, int], None]] = None) -> list:
+def condense_texts(texts: list, chars_per_line: int = 37, lines_per_subtitle: int = 2, progress_callback: Optional[Callable[[str, int, int], None]] = None) -> list:
     """
     Wrapper-funktion for kondensering af en batch tekster med kontekstbevidsthed.
     
     Args:
         texts: Liste af tekster der skal kondenseres
-        max_chars: Maksimalt antal tegn i output for hver tekst
+        chars_per_line: Tegn per linje (default: 37)
+        lines_per_subtitle: Antal linjer per undertekst (default: 2)
         progress_callback: Callback funktion for fremskridt
         
     Returns:
         list: Liste af kondenserede tekster
     """
-    config = CondensationConfig(max_chars=max_chars)
+    config = CondensationConfig(chars_per_line=chars_per_line, lines_per_subtitle=lines_per_subtitle)
     condenser = TextCondenser(config)
     return condenser.condense_text_batch(texts, progress_callback)

@@ -308,22 +308,20 @@ class ProcessingThread(QThread):
                         lines_per_subtitle=2,        # ✅ Tilføj lines_per_subtitle 
                         progress_callback=lambda msg, i, total: self.status_update.emit(f"{msg} ({i+1}/{total})")
                     )
-
+                        
                     # Opdater undertekster med kondenserede versioner
                     for idx, condensed in zip(text_indices, condensed_texts):
                         if condensed:
-                            # Formatér den kondenserede tekst
+                            # Formatér den kondenserede tekst (altid!)
                             formatted_condensed, still_needs_condensing = formatter.format_text(condensed)
-                            if not still_needs_condensing:
-                                subs[idx].text = formatted_condensed
-                            else:
-                                subs[idx].text = condensed
+                            subs[idx].text = formatted_condensed  # ✅ Altid formateret!
                             stats["condensed"] += 1
                         else:
-                            # Hvis kondensering fejlede, behold original formatering
-                            subs[idx].text = formatted_texts[idx]
+                            # Hvis kondensering fejlede, formatér den originale tekst
+                            formatted_original, _ = formatter.format_text(subs[idx].text)
+                            subs[idx].text = formatted_original
                             stats["errors"] += 1
-                    
+
                     sub_progress = int(current_progress + 25)
                     self.progress_update.emit(sub_progress)
 
@@ -331,7 +329,7 @@ class ProcessingThread(QThread):
                 adjust_subtitle_gaps(subs, fps=25)
 
                 # Gem opdateret SRT
-                output_path = f"{base_path}_final.srt"
+                output_path = f"{base_path}_kondenseret.srt"
                 subs.save(output_path, encoding='utf-8')
 
                 # Vis statistik
